@@ -1,0 +1,7 @@
+demucs
+numpy
+torch
+onnx
+onnxsim
+onnxruntime
+amd-quark

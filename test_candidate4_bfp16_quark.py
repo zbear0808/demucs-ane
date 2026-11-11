@@ -1,0 +1,52 @@
+import os
+import time
+import glob
+import numpy as np
+import onnxruntime as ort
+
+os.environ["VAIP_VERBOSITY"] = "1"
+os.environ["XLNX_ONNX_EP_VERBOSE"] = "1"
+
+VAIP_CONFIG = r"C:\Users\zubair\miniconda3\envs\ryzen-ai-1.8.0\Lib\site-packages\misc\vaip_config.json"
+cache_dir = os.path.abspath("./xdna2_cache")
+quark_dll = r"C:\Users\zubair\AppData\Local\torch_extensions\torch_extensions\Cache\py312_cpu\quark_custom_ops_stable_abi\quark_custom_ops_stable_abi.dll"
+
+torch_lib = r"C:\Users\zubair\Documents\GitHub\demucs-npu\.venv\Lib\site-packages\torch\lib"
+if os.path.exists(torch_lib):
+    os.environ["PATH"] = f"{torch_lib};{os.environ.get('PATH', '')}"
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(torch_lib)
+
+print("--- Testing Candidate 4: htdemucs_drums_xdna2_bfp16.onnx ---", flush=True)
+so = ort.SessionOptions()
+so.log_severity_level = 1
+
+if os.path.exists(quark_dll):
+    print(f"Registering custom ops DLL: {quark_dll}")
+    so.register_custom_ops_library(quark_dll)
+
+try:
+    sess = ort.InferenceSession(
+        "htdemucs_drums_xdna2_bfp16.onnx",
+        sess_options=so,
+        providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        provider_options=[
+            {
+                "config_file": VAIP_CONFIG,
+                "cacheDir": cache_dir,
+                "cacheKey": "demucs_bfp16_quark",
+            },
+            {},
+        ],
+    )
+    print(f"[OK] Session initialized! Providers: {sess.get_providers()}", flush=True)
+
+    inputs = {
+        "x_spec": np.zeros((1, 4, 2048, 336), dtype=np.float32),
+        "x_time": np.zeros((1, 2, 1, 344064), dtype=np.float32),
+    }
+    t0 = time.perf_counter()
+    out = sess.run(None, inputs)
+    print(f"[OK] Inference completed in {(time.perf_counter()-t0)*1000:.1f}ms!", flush=True)
+except Exception as e:
+    print(f"[FAIL] {e}", flush=True)
