@@ -1,0 +1,13 @@
+# Apple Neural Engine build (macOS, Apple Silicon). Python 3.12:
+#   uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r ane/requirements.txt
+# torch is pinned to 2.7.0: the newest version coremltools 9.0 is tested against.
+torch==2.7.0
+torchaudio==2.7.0
+demucs==4.1.0
+coremltools==9.0
+numpy==2.5.4
+onnx==1.23.2
+onnxsim==0.8.1
+onnxscript==0.7.2
+onnxconverter-common==1.16.0
+onnxruntime==1.31.1
