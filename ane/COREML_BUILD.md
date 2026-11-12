@@ -307,7 +307,7 @@ One caution when reproducing it: the ANE is shared. Another process using it at 
 
 ## 7. Loading: compile once
 
-Loading `ct.models.MLModel("x.mlpackage")` costs about 25 s every time. The compile of the package takes only 0.3 s. The rest is Core ML building the ANE program, which the OS caches keyed by the path of the compiled model, and `MLModel(mlpackage)` compiles into a fresh temporary directory on each launch, so the cache never hits. `ane_tools.load_coreml()` compiles once into `ane/models/compiled/<name>_<build time>.mlmodelc` and loads that fixed path with `ct.models.CompiledMLModel`. After the first launch, loads take about 0.1 s, even from a new process. The build time is part of the folder name, so a rebuilt model never reuses a stale ANE program. The cache can evict entries: after many extra programs had been built during profiling, a model that had been cached needed the full 25 s again. An app should expect a slow first load after an OS update and on first install.
+Loading `ct.models.MLModel("x.mlpackage")` costs about 25 s every time. The compile of the package takes only 0.3 s. The rest is Core ML building the ANE program, which the OS caches keyed by the path of the compiled model, and `MLModel(mlpackage)` compiles into a fresh temporary directory on each launch, so the cache never hits. `ane_tools.load_coreml()` compiles once into `ane/models/compiled/<name>_<build time>.mlmodelc` and loads that fixed path with `ct.models.CompiledMLModel`. After the first launch, loads take about 0.1 s, even from a new process. The build time is part of the folder name, so a rebuilt model never reuses a stale ANE program. The key uses the newest modification time of the package's model files and deliberately ignores `Manifest.json`: coremltools rewrites that file (same content, new timestamp) whenever it opens a package, and counting it made the audit step silently invalidate the cache. No cache eviction was seen: with all four packages loaded in turn from fresh processes, each still loaded warm. Not tested: reboots and OS updates. An app should expect a slow first load on first install and after an OS update.
 
 ## 8. The fused model
 
@@ -331,6 +331,7 @@ Loading `ct.models.MLModel("x.mlpackage")` costs about 25 s every time. The comp
 | `mul` and two `cast` ops on the CPU, "not ANE-capable" (iSTFT) | A constant of about 1e8 (1 / window sum at the edges) does not fit fp16, so coremltools keeps the op in fp32 | Clamp it to 100; only cropped-away samples are affected |
 | iSTFT 25 dB worse than expected | `torch.export` merges example inputs that are the same tensor object, which tied `mean_s` to `std_s` | Pass distinct tensors (zeros and ones) |
 | 25 s start-up on every launch | `MLModel("x.mlpackage")` recompiles into a new temp path and the ANE cache is path-keyed | `load_coreml()` (compile once) |
+| A cached model loads in 25 s again after coremltools opened the package | The cache key included `Manifest.json`'s timestamp, which coremltools rewrites on every open | Key on the model files only (`compiled_path()`) |
 | Chunks randomly twice as slow | Another process is using the ANE | Check ANE power at baseline (`measure_ane_usage.py` warns) |
 | `ct.convert("model.onnx")` -> "Unable to determine the type of the model" | coremltools has no ONNX frontend | Start from the PyTorch model |
 

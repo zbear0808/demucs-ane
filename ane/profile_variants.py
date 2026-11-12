@@ -122,8 +122,8 @@ def load_and_memory(pkgs):
         shutil.copytree(c, dst)
         fresh.append(dst)
     cold = child(fresh, feeds)
-    # Warm: prime the persistent paths once, then measure. The OS ANE cache is LRU with a
-    # limited size, so an entry that has not been used lately may need rebuilding first.
+    # Warm: prime the persistent paths once, then measure. The first load of a path builds its
+    # ANE program, so a path nobody has loaded yet would otherwise be timed as "warm" at ~25 s.
     child(compiled, feeds)
     warm = child(compiled, feeds)
     shutil.rmtree(tmp, ignore_errors=True)

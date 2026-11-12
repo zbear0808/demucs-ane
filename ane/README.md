@@ -71,6 +71,19 @@ ane-dsp and fused land within run-to-run noise of each other, and both are 4–9
 
 **GPU load slows the ANE.** With a Blender Metal render keeping the GPU 98% busy, ANE model latency rose from 366 ms to 459 ms (+25%), and drums end to end went from 12.6 s to 16.0 s. The ANE shares memory bandwidth with the GPU, so benchmark with the GPU idle.
 
+## Core ML models
+
+Four packages, two per stem. The "split" ones run the separation network on the ANE and leave STFT/iSTFT to the CPU; the "fused" ones run the whole pipeline on the ANE. All four are 100% on the ANE by Core ML's compute plan. They are git-ignored (rebuild with the commands shown), and `ane/models/` is where they land.
+
+| Package | Stem | Ops on ANE | Size | Worst error below mix (need >= 40 dB) | Time per 7.8 s chunk (model call) | Build |
+| :--- | :--- | :--- | ---: | ---: | ---: | :--- |
+| `htdemucs_drums_ane.mlpackage` | drums | 1,696 / 1,696 | 87 MB | 45.9 dB | 358 ms | `export_htdemucs_ane.py` |
+| `htdemucs_drums_fused_ane.mlpackage` | drums | 1,741 / 1,741 | 152 MB | 46.0 dB | 376 ms | `export_htdemucs_ane.py --fused` |
+| `htdemucs_vocals_ane.mlpackage` | vocals | 1,696 / 1,696 | 87 MB | 61.8 dB | 360 ms | `export_htdemucs_ane.py --source vocals` |
+| `htdemucs_vocals_fused_ane.mlpackage` | vocals | 1,741 / 1,741 | 152 MB | 59.4 dB | 376 ms | `export_htdemucs_ane.py --source vocals --fused` |
+
+Each build takes 2 to 3 minutes and ends with the placement audit and a real-audio accuracy check. Each model also scores about 2 dB when checked against the other stem's reference, so the stems are not mixed up. Timing was taken with the machine idle (ANE, CPU and GPU all quiet).
+
 ## Quick start
 
 ```bash

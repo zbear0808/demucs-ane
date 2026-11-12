@@ -90,7 +90,10 @@ def compiled_path(mlpackage) -> Path:
     import coremltools as ct
 
     src = Path(mlpackage)
-    newest_src = int(max(f.stat().st_mtime for f in src.rglob("*") if f.is_file()))
+    # Key on the files that hold the model, not on Manifest.json: coremltools rewrites that file (same content,
+    # new mtime) every time it opens the package, which used to change the key and force a 25 s ANE rebuild.
+    model_files = [f for f in src.rglob("*") if f.is_file() and f.name != "Manifest.json"]
+    newest_src = int(max(f.stat().st_mtime for f in model_files))
     # The build time goes into the name, so a rebuilt package never reuses a stale OS-side ANE cache entry.
     dst = COMPILED_DIR / f"{src.stem}_{newest_src}.mlmodelc"
     if not dst.exists():
