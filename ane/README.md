@@ -34,6 +34,41 @@ The vocals reference (`ane/parity_real_audio_vocals.npz`) is built automatically
 
 With `CPU_AND_NE`, the ANE draws power and the GPU and CPU stay at their idle baseline, so the compute runs on the ANE. `ALL` also chooses the ANE. These numbers were taken while a Blender GPU render was running in the background (GPU ~80% busy at idle). That load slows everything slightly, and the GPU row is pessimistic.
 
+## Benchmark run (M1, macOS 27.2, GPU idle unless noted)
+
+Model only, per 7.8 s chunk (`measure_ane_usage.py`, drums; vocals is the same graph and gives the same numbers):
+
+| Compute units | Median latency | Power above idle | Energy / chunk |
+| :--- | ---: | :--- | ---: |
+| `CPU_AND_NE` | 366 ms (21.3x RT) | ANE +2.5 W | **~0.9 J** |
+| `ALL` | 366 ms | ANE +2.5 W (Core ML picks the ANE) | ~0.9 J |
+| `CPU_AND_GPU` | **309 ms** (25.2x RT) | GPU +8.0 W | ~2.5 J |
+| `CPU_ONLY` | 503 ms (15.5x RT) | CPU +5.5 W | ~2.8 J |
+
+On an idle M1 the GPU is about 15% faster than the ANE, but it uses about 3x the energy per chunk. The ANE leaves both the GPU and CPU free.
+
+Full pipeline per chunk (`benchmark_pipeline.py`, 30 real-audio chunks):
+
+| | drums | vocals |
+| :--- | ---: | ---: |
+| cpu-dsp (numpy STFT/iSTFT) | 405–409 ms | 405 ms |
+| ane-dsp (STFT/iSTFT on the ANE) | 379–394 ms | 379 ms |
+| fused (one Core ML call) | 376 ms | 376 ms |
+| worst error below mix | 45.9 / 46.0 / 46.0 dB | 61.8 / 59.4 / 59.4 dB |
+
+ane-dsp and fused land within run-to-run noise of each other, and both are 4–9% faster than cpu-dsp.
+
+3-minute track end to end (`separate_ane.py`, excludes the ~24 s model load):
+
+| | `--dsp cpu` | `--dsp ane` |
+| :--- | ---: | ---: |
+| drums | 12.6 s (14.3x RT) | 12.1 s (14.9x RT) |
+| vocals | 12.6 s (14.3x RT) | 13.0 s (13.8x RT)* |
+
+\* Run while a Blender GPU render was starting or finishing.
+
+**GPU load slows the ANE.** With a Blender Metal render keeping the GPU 98% busy, ANE model latency rose from 366 ms to 459 ms (+25%), and drums end to end went from 12.6 s to 16.0 s. The ANE shares memory bandwidth with the GPU, so benchmark with the GPU idle.
+
 ## Quick start
 
 ```bash
