@@ -12,7 +12,7 @@ which already removes most of what the Apple Neural Engine dislikes:
 On top of that, for the ANE:
   1. Static shapes. forward() does no shape arithmetic, so torch.export / coremltools
      produce a fully static graph (no einops, no `H // 4` int casts).
-  2. Row-folded time branch. The ANE rejects any tensor dimension > 16384, and the
+  2. Row-folded time branch. The ANE rejects any tensor dimension > 16384 (see probe_placement.py), and the
      time branch runs at 344064 / 86016 / 21504 samples. [1, C, 1, L] is folded into
      [1, C, R, L/R] (a free reshape) and every conv along W takes a "halo" from the
      neighbouring rows, so the maths is identical to the unfolded conv.

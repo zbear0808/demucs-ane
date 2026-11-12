@@ -7,8 +7,8 @@ Three pipelines per 7.8 s chunk, all on real audio (the parity reference chunks)
   ane-dsp  ANE STFT model -> ANE separation model -> ANE iSTFT model  (3 Core ML calls)
   fused    ANE [STFT + separation + iSTFT] in one Core ML program     (1 call)
 
-Every stage is timed separately. The fixed cost of a Core ML call (fp32<->fp16 input/output
-conversion and dispatch, all on the CPU) is measured with "passthrough" models that have
+Every stage is timed separately. The fixed cost of a Core ML call (moving the arrays in and out
+and dispatch, all on the CPU) is measured with "passthrough" models that have
 the same I/O and almost no compute. Accuracy (error below the mix vs stock
 Demucs) is reported for each pipeline so that speed is not bought with quality.
 
@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 import dsp_ane as dsp  # noqa: E402
 from ane_modules import SPEC_SHAPE, TIME_SHAPE, build_ane_model  # noqa: E402
 from ane_tools import (  # noqa: E402
-    MODELS_DIR, SAMPLE_RATE, SEGMENT_LEN, compute_plan_summary, convert_fp16, cpu_postproc_numpy,
+    MODELS_DIR, SAMPLE_RATE, load_coreml, SEGMENT_LEN, compute_plan_summary, convert_fp16, cpu_postproc_numpy,
     cpu_preproc_numpy, fold_time, load_ref, mlpackage_path, ref_path, snr_db, unfold_time,
 )
 
@@ -49,9 +49,7 @@ class Passthrough(nn.Module):
 
 
 def _load(path, units="CPU_AND_NE"):
-    import coremltools as ct
-
-    return ct.models.MLModel(str(path), compute_units=getattr(ct.ComputeUnit, units))
+    return load_coreml(path, units)
 
 
 def build_models(source: str, rebuild: bool):
@@ -172,8 +170,7 @@ def main():
     print("\nCore ML call overhead with ~zero compute (passthrough models with the same I/O):")
     print(f"  separation-model I/O (x_spec + x_time in and out): {1000 * ovh['model']:.1f} ms")
     print(f"  STFT-block I/O ([1, 2, 343, 1024] in and out):      {1000 * ovh['stft']:.1f} ms")
-    print("  This is CPU-side work inside every predict(): fp32 <-> fp16 conversion of the")
-    print("  arrays and copying them into and out of the ANE's buffers.")
+    print("  This is CPU-side work inside every predict(): moving the arrays into and out of Core ML.")
 
     pipelines = {"cpu-dsp": run_cpu_dsp, "ane-dsp": run_ane_dsp, "fused": run_fused}
     totals = {}

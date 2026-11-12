@@ -8,9 +8,13 @@ A small pipeline overlaps CPU STFT/iSTFT with the ANE run of the neighbouring ch
   .venv/bin/python ane/separate_ane.py --input-dir ~/Music/songs
   .venv/bin/python ane/separate_ane.py --single-file song.wav --source vocals
   .venv/bin/python ane/separate_ane.py --single-file song.wav --onnx ane/models/htdemucs_drums_ane_fp16.onnx
+  .venv/bin/python ane/separate_ane.py --single-file song.wav --dsp fused        # whole pipeline in one ANE program
+  .venv/bin/python ane/separate_ane.py --single-file song.wav --dsp fused \\
+      --onnx ane/models/htdemucs_drums_fused_ane_fp16.onnx                      # same, via ONNX Runtime
 """
 import argparse
 import os
+import resource
 import subprocess
 import sys
 import time
@@ -19,12 +23,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ane_tools import (
-    ANE_DIR, COMPUTE_UNITS, mlpackage_path, SAMPLE_RATE, SEGMENT_LEN, cpu_postproc_numpy, cpu_preproc_numpy,
-    fold_time, unfold_time,
-)
 import dsp_ane as dsp
-from ane_tools import MODELS_DIR
+from ane_tools import (
+    ANE_DIR, COMPUTE_UNITS, FUSED_IO, MODELS_DIR, SAMPLE_RATE, SEGMENT_LEN, SPLIT_IO, cpu_postproc_numpy,
+    cpu_preproc_numpy, fold_time, fused_mlpackage_path, load_coreml, mlpackage_path, unfold_time,
+)
 from parity_ane import CoreMLRunner, OnnxCoreMLRunner
 
 EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".aiff", ".ogg")
@@ -58,11 +61,8 @@ class AneDSP:
     """STFT/iSTFT as Core ML models on the ANE (dsp_ane.py); only padding and the crop stay on the CPU."""
 
     def __init__(self, units):
-        import coremltools as ct
-
-        cu = getattr(ct.ComputeUnit, units)
-        self.stft = ct.models.MLModel(str(MODELS_DIR / "htdemucs_stft_ane.mlpackage"), compute_units=cu)
-        self.istft = ct.models.MLModel(str(MODELS_DIR / "htdemucs_istft_ane.mlpackage"), compute_units=cu)
+        self.stft = load_coreml(MODELS_DIR / "htdemucs_stft_ane.mlpackage", units)
+        self.istft = load_coreml(MODELS_DIR / "htdemucs_istft_ane.mlpackage", units)
 
     def prep(self, chunk):
         s = self.stft.predict({"blocks": dsp.reflect_pad_numpy(chunk)})
@@ -75,8 +75,25 @@ class AneDSP:
         return (dsp.crop_istft(w) + unfold_time(time_)[:, :, 0, :] * std_t + mean_t)[0]
 
 
-def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool = True, dsp_impl=None) -> np.ndarray:
-    """audio: [2, n] -> separated stem [2, n] (triangular-window overlap-add)."""
+class FusedDSP:
+    """
+    For the fused model (STFT + separation + iSTFT in one ANE program). The CPU only does the
+    reflect padding and time-branch statistics before the call, and the crop and the final
+    add after it: about 1 ms per chunk.
+    """
+
+    def prep(self, chunk):
+        x_time, mean_t, std_t = dsp.time_stats_numpy(chunk)
+        return dsp.reflect_pad_numpy(chunk), fold_time(x_time), (mean_t, std_t)
+
+    def post(self, wav_blocks, out_time, stats):
+        mean_t, std_t = stats
+        return (dsp.crop_istft(wav_blocks) + unfold_time(out_time)[:, :, 0, :] * std_t + mean_t)[0]
+
+
+def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool = True, dsp_impl=None,
+                   timing: dict = None) -> np.ndarray:
+    """audio: [2, n] -> separated stem [2, n] (triangular-window overlap-add). `timing` collects per-chunk ms."""
     total = audio.shape[-1]
     stride = int((1.0 - overlap) * SEGMENT_LEN)
     ref_mean, ref_std = audio.mean(), audio.std() + 1e-8
@@ -116,8 +133,10 @@ def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool 
             if pending is not None:
                 pending.result()
             pending = pool.submit(post, i, spec, time_, stats)
+            dt = time.perf_counter() - t0
+            if timing is not None:
+                timing.setdefault("chunk_ms", []).append(1000 * dt)
             if verbose:
-                dt = time.perf_counter() - t0
                 print(f"    chunk {i + 1:3d}/{n_chunks}: {dt * 1000:6.0f} ms ({SEGMENT_LEN / SAMPLE_RATE / dt:5.1f}x RT)",
                       flush=True)
         pending.result()
@@ -134,15 +153,18 @@ def main():
     src.add_argument("--single-file")
     p.add_argument("--source", default="drums", help="Stem name: picks the default --model and output naming")
     p.add_argument("--output-dir", default=None, help="Default: <input>/ane_<source>")
-    p.add_argument("--model", default=None, help="Default: ane/models/htdemucs_<source>_ane.mlpackage")
+    p.add_argument("--model", default=None,
+                   help="Default: ane/models/htdemucs_<source>_ane.mlpackage (…_fused_ane.mlpackage with --dsp fused)")
     p.add_argument("--onnx", default=None, help="Use an ONNX model via ORT's CoreML EP instead of the .mlpackage")
     p.add_argument("--units", choices=COMPUTE_UNITS, default="CPU_AND_NE")
     p.add_argument("--overlap", type=float, default=0.25)
-    p.add_argument("--dsp", choices=("cpu", "ane"), default="cpu",
-                   help="Where the STFT/iSTFT run (ane needs the models from benchmark_pipeline.py)")
+    p.add_argument("--dsp", choices=("cpu", "ane", "fused"), default="cpu",
+                   help="Where the STFT/iSTFT run: cpu = numpy; ane = separate ANE models; "
+                        "fused = one ANE program with the whole pipeline (models come from benchmark_pipeline.py)")
     p.add_argument("-q", "--quiet", action="store_true")
     args = p.parse_args()
-    args.model = args.model or str(mlpackage_path(args.source))
+    fused = args.dsp == "fused"
+    args.model = args.model or str(fused_mlpackage_path(args.source) if fused else mlpackage_path(args.source))
 
     if args.single_file:
         tracks = [os.path.abspath(os.path.expanduser(args.single_file))]
@@ -158,21 +180,28 @@ def main():
     if args.onnx:
         run = OnnxCoreMLRunner(args.onnx, args.units, cache_dir=ANE_DIR / "models" / "ort_coreml_cache")
     else:
-        run = CoreMLRunner(args.model, args.units)
-    dsp_impl = AneDSP(args.units) if args.dsp == "ane" else CpuDSP()
+        run = CoreMLRunner(args.model, args.units, FUSED_IO if fused else SPLIT_IO)
+    dsp_impl = {"ane": lambda: AneDSP(args.units), "fused": FusedDSP, "cpu": CpuDSP}[args.dsp]()
     print(f"[INIT] {args.onnx or args.model} [{args.units}, {args.dsp} STFT] loaded in {time.perf_counter() - t0:.1f}s")
 
     for n, path in enumerate(tracks, 1):
         name = Path(path).stem
         print(f"\n[{n}/{len(tracks)}] {name}")
         audio = load_audio(path)
-        t0 = time.perf_counter()
-        stem = separate_track(run, audio, args.overlap, verbose=not args.quiet, dsp_impl=dsp_impl)
-        dt = time.perf_counter() - t0
+        t0, cpu0 = time.perf_counter(), time.process_time()
+        st = {}
+        stem = separate_track(run, audio, args.overlap, verbose=not args.quiet, dsp_impl=dsp_impl, timing=st)
+        dt, cpu = time.perf_counter() - t0, time.process_time() - cpu0
         dur = audio.shape[-1] / SAMPLE_RATE
         dest = os.path.join(out_dir, f"{name}_{args.source}.wav")
         save_wav(dest, stem)
+        ms = np.array(st["chunk_ms"])
         print(f"  {dur:.1f}s of audio in {dt:.1f}s ({dur / dt:.1f}x real-time) -> {dest}")
+        print(f"  this process used {cpu:.1f} s of CPU time ({100 * cpu / dt:.0f}% of one core) and peaked at "
+              f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.0f} MB resident memory")
+        print(f"  per chunk: median {np.median(ms):.0f} ms, p90 {np.percentile(ms, 90):.0f} ms, max {ms.max():.0f} ms"
+              + ("  <- p90 is well above the median: another process was probably using the ANE/CPU"
+                 if np.percentile(ms, 90) > 1.25 * np.median(ms) else ""))
     return 0
 
 

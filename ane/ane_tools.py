@@ -19,6 +19,20 @@ def onnx_path(source: str = "drums") -> Path:
     return MODELS_DIR / f"htdemucs_{source}_ane.onnx"
 
 
+def fused_mlpackage_path(source: str = "drums") -> Path:
+    """STFT + separation + iSTFT in one Core ML program."""
+    return MODELS_DIR / f"htdemucs_{source}_fused_ane.mlpackage"
+
+
+def fused_onnx_path(source: str = "drums", fp16: bool = True) -> Path:
+    return MODELS_DIR / f"htdemucs_{source}_fused_ane{'_fp16' if fp16 else ''}.onnx"
+
+
+# I/O names of the two model families (both take two inputs and return two outputs).
+SPLIT_IO = {"inputs": ("x_spec", "x_time"), "outputs": ("out_spec", "out_time")}
+FUSED_IO = {"inputs": ("blocks", "x_time"), "outputs": ("wav_blocks", "out_time")}
+
+
 def ref_path(source: str = "drums") -> Path:
     """Drums reuses the XDNA2 reference; other sources get one built by make_ref()."""
     return DRUMS_REF if source == "drums" else ANE_DIR / f"parity_real_audio_{source}.npz"
@@ -58,6 +72,43 @@ def compute_unit(name: str):
     import coremltools as ct
 
     return getattr(ct.ComputeUnit, name)
+
+
+COMPILED_DIR = MODELS_DIR / "compiled"
+
+
+def compiled_path(mlpackage) -> Path:
+    """
+    Compile `mlpackage` to a persistent .mlmodelc (once, ~0.3 s) and return its path.
+
+    The ~25 s "load time" of these models is not the mlpackage compile. It is Core ML
+    building the ANE program, and the OS caches that keyed on the compiled model's path.
+    ct.models.MLModel(mlpackage) compiles into a new temp dir each time, so it pays the
+    25 s on every launch. Loading a fixed .mlmodelc path pays it once, and later loads
+    (including from new processes) take ~0.1 s.
+    """
+    import coremltools as ct
+
+    src = Path(mlpackage)
+    newest_src = int(max(f.stat().st_mtime for f in src.rglob("*") if f.is_file()))
+    # The build time goes into the name, so a rebuilt package never reuses a stale OS-side ANE cache entry.
+    dst = COMPILED_DIR / f"{src.stem}_{newest_src}.mlmodelc"
+    if not dst.exists():
+        import shutil
+
+        COMPILED_DIR.mkdir(parents=True, exist_ok=True)
+        for old in COMPILED_DIR.glob(f"{src.stem}_*.mlmodelc"):
+            shutil.rmtree(old, ignore_errors=True)
+        tmp = ct.utils.compile_model(str(src))
+        shutil.move(tmp, dst)
+    return dst
+
+
+def load_coreml(mlpackage, units: str = "CPU_AND_NE"):
+    """Load via a cached .mlmodelc (see compiled_path). Has the same .predict() as MLModel."""
+    import coremltools as ct
+
+    return ct.models.CompiledMLModel(str(compiled_path(mlpackage)), compute_units=compute_unit(units))
 
 
 def compute_plan_summary(mlpackage: str, units: str = "CPU_AND_NE", top: int = 15) -> dict:

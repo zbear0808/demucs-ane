@@ -1,6 +1,8 @@
 # HTDemucs Drums & Vocals on the Apple Neural Engine
 
-The Apple-side version of `option_a_bfp16/`. It takes the same HTDemucs (`f7e0c4bc`) model, pruned to a single stem (drums or vocals; bass and other also work via `--source`), and builds it for the Apple Neural Engine (ANE). The output is a **Core ML ML Program** (`.mlpackage`) plus an **ONNX** copy that ONNX Runtime's CoreML execution provider can run.
+The Apple-side version of `option_a_bfp16/`. It takes the same HTDemucs (`f7e0c4bc`) model, pruned to a single stem (drums or vocals; `--source bass` and `--source other` are wired up but have not been built or tested), and builds it for the Apple Neural Engine (ANE). The output is a **Core ML ML Program** (`.mlpackage`) plus an **ONNX** copy that ONNX Runtime's CoreML execution provider can run.
+
+How the Core ML model was made (the rewrites, what broke, how each problem was diagnosed): **[COREML_BUILD.md](COREML_BUILD.md)**.
 
 Measured on an Apple M1 (macOS 27.2), drums:
 
@@ -10,7 +12,7 @@ Measured on an Apple M1 (macOS 27.2), drums:
 | `htdemucs_drums_ane_fp16.onnx` (ORT CoreML EP) | 1782 / 1782 nodes, 1 partition | ~0.38 s (~20x RT) | 46.0 dB (PASS) |
 | `htdemucs_drums_ane.onnx` fp32 (ORT CoreML EP) | runs on CPU/GPU, not on the ANE | ~1.2 s | 64.9 dB |
 
-End to end, including STFT/iSTFT and overlap-add, a 3-minute track separates in 17.3 s (**10.4x real time**). On top of that, each run of the script spends about 27 s loading the model, which is a one-time cost per run. For comparison, the XDNA2 pipelined runner does about 2.1x.
+End to end, including STFT/iSTFT and overlap-add, a 3-minute track separates in 17.3 s (**10.4x real time**). Model loading takes ~25 s on the very first launch (Core ML builds the ANE program) and ~0.1 s after that, because the scripts load a cached compiled `.mlmodelc`; see [PERFORMANCE.md](PERFORMANCE.md). For comparison, the XDNA2 pipelined runner does about 2.1x.
 
 ### Vocals (`--source vocals`)
 
@@ -58,7 +60,7 @@ Full pipeline per chunk (`benchmark_pipeline.py`, 30 real-audio chunks):
 
 ane-dsp and fused land within run-to-run noise of each other, and both are 4–9% faster than cpu-dsp.
 
-3-minute track end to end (`separate_ane.py`, excludes the ~24 s model load):
+3-minute track end to end (`separate_ane.py`, excludes model load):
 
 | | `--dsp cpu` | `--dsp ane` |
 | :--- | ---: | ---: |
@@ -108,6 +110,9 @@ The parity check uses `option_a_bfp16/parity_real_audio.npz`, the same reference
 | `measure_ane_usage.py` | Checks CPU/GPU/ANE usage by measuring power while the model runs (`brew install macmon`, no sudo), plus a latency breakdown |
 | `dsp_ane.py` | STFT / iSTFT written as matmul models for the ANE, plus a fused STFT + model + iSTFT pipeline |
 | `benchmark_pipeline.py` | Per-stage ANE vs CPU timing for CPU-DSP, ANE-DSP and fused pipelines, with accuracy |
+| `profile_variants.py` | Size / load / memory / runtime comparison of split, split3 and fused, plus per-stage ANE time ([PERFORMANCE.md](PERFORMANCE.md)) |
+| `COREML_BUILD.md` | **How the Core ML model was built**: the recipe, what broke and how each problem was diagnosed |
+| `probe_placement.py`, `probe_precision.py` | The two experiments behind the design rules (16384 cap; precision of fused activations) |
 | `separate_ane.py` | Batch runner; CPU STFT/iSTFT of neighbouring chunks overlaps the ANE run |
 
 ## Model I/O
@@ -124,7 +129,7 @@ There is no public ANE compiler. The only route onto the ANE is Core ML, and Cor
 
 1. **Reuse the pure-AIE rewrites.** Dilated convs become dense kernels, stride-4 convs are unfolded into 1x1 convs, ConvTranspose becomes polyphase 1x1 convs, and everything is 4D. The ANE dislikes dilated convs, transposed convs and rank > 4 tensors, so these carried over directly. With nothing else changed, **64%** of the estimated cost ran on the ANE.
 2. **Static shapes.** coremltools' TorchScript frontend cannot lower `H // 4`-style shape maths, and einops in the cross transformer has the same problem. All forwards were rewritten with constant shapes, positional embeddings were pre-baked, and the export now goes through `torch.export`.
-3. **The 16384 dimension limit (the big one).** The ANE rejects any tensor dimension larger than 16384. The time branch runs at 344064, 86016 and 21504 samples, so every time-branch op fell back to the CPU. Fix: fold `[1, C, 1, L]` into `[1, C, R, L/R]`, which is a free reshape. Every conv along W then gets a **halo** of `p` columns copied from the neighbouring rows, so the result stays bit-exact. The polyphase upsampler emits 4x more rows instead of 4x wider rows. Result: **100% on the ANE**.
+3. **The 16384 dimension limit (the big one).** The ANE rejects any tensor dimension larger than 16384 (bisected with `probe_placement.py`: 16384 runs on the ANE, 16385 on the CPU). The time branch runs at 344064, 86016 and 21504 samples, so every time-branch op fell back to the CPU. Fix: fold `[1, C, 1, L]` into `[1, C, R, L/R]`, which is a free reshape. Every conv along W then gets a **halo** of `p` columns copied from the neighbouring rows, so the result stays bit-exact. The polyphase upsampler emits 4x more rows instead of 4x wider rows. Result: **100% on the ANE**.
 4. **fp16 precision.** The ANE computes in fp16 only. The first all-ANE build missed the bar at 35.5 dB below the mix (target 40).
    - Per-op microbenchmarks showed that most ops are at fp16 precision (~66–75 dB). The exception: when the ANE compiler **fuses sigmoid/GELU into the preceding conv**, it uses a low-precision approximation (45–52 dB per op).
    - Writing the activations as `x / (1 + exp(-z))` avoids the fused path. GLU uses this directly, and GELU uses the tanh approximation (~61 dB away from erf-GELU on real audio, well under the fp16 noise floor). This took the worst case from 35.5 dB to **45.9 dB**.
@@ -136,7 +141,7 @@ Use `export_htdemucs_ane.py --debug-taps` to print per-layer ANE-vs-FP32 SNR, wh
 ## Known limits
 
 - The worst-case spec SNR (27.6 dB on song 3) comes from a chunk where the drums are nearly silent. The error there is still 70.8 dB below the mix.
-- Core ML compiles the `.mlpackage` the first time it loads (~20 s); later loads are cached by the OS.
+- The first load builds the ANE program (~25 s). After that, loads take ~0.1 s from the cached `ane/models/compiled/*.mlmodelc` (see PERFORMANCE.md).
 
 ## STFT / iSTFT on the ANE
 
@@ -156,7 +161,7 @@ The ANE has no FFT. At these sizes, though, a DFT is cheap as one dense matmul: 
 | ANE / CPU split | 91% / 9% | ~100% / <1% | ~100% / <1% |
 | Worst error below mix | 45.9 dB | 46.0 dB | 46.0 dB |
 
-- About **4 ms of each separation-model call is CPU work** inside `predict()`: converting the fp32 inputs and outputs to and from fp16, plus the copies. This was measured with a passthrough model that has the same I/O. The rest, about 363 ms, is ANE compute.
+- About **4 ms of each separation-model call is CPU-side array handling** inside `predict()` (getting the inputs into Core ML and the outputs back out as numpy). This was measured with a passthrough model that has the same I/O. The model's I/O is already declared fp16, and feeding fp16 numpy arrays instead made no difference (369 vs 372 ms). The rest, about 363 ms, is ANE compute.
 - On the ANE, the STFT is **6–7 ms vs 14–16 ms** in numpy and the iSTFT **6 ms vs 24 ms**. Accuracy is unchanged (ANE STFT 61 dB vs the numpy STFT).
 - Per chunk in sequence, ANE DSP saves about 7% (406 to 379 ms). End to end the gain is much smaller: `separate_ane.py` already runs the numpy DSP on worker threads while the ANE works. A 3-minute track takes 12.3 s with CPU DSP and 12.1 s with ANE DSP (`--dsp ane`). The two outputs differ by an error 56.7 dB below the mix. The real win is CPU time freed up, not speed.
 - Fused is not faster: the single program (386 ms) is about 9 ms slower than the three separate ANE calls (378 ms). The ~5 ms of copies it saves is less than whatever the bigger graph costs in scheduling.
@@ -169,7 +174,7 @@ The ANE has no FFT. At these sizes, though, a DFT is cheap as one dense matmul: 
 | Final iSTFT crop | CPU | Starts 3584 samples into the buffer, not on a 1024-block boundary, so it is an unaligned slice of a >16384-wide tensor. In numpy it is a free view |
 | Overlap-add across chunks | CPU | Spans separate model calls |
 | Time-branch mean/std (two scalars) and the final add | CPU | Could run on the ANE, but it is ~1 ms and needs the unaligned crop anyway |
-| fp32 <-> fp16 input/output casts | CPU | The ANE is fp16-only, so Core ML always casts fp32 I/O on the CPU (~4 ms per model call). Declaring fp16 model I/O would move this into numpy; it was not worth it here |
+| Input/output array handling in `predict()` | CPU | ~4 ms per model call of moving arrays into and out of Core ML. The model's I/O is already declared fp16 (coremltools' default for this target), and passing fp16 numpy arrays made no measurable difference |
 | *Fixed:* the first iSTFT's final `mul` + 2 casts | CPU -> ANE | The 1/window-sum constant reached ~1e8 at the buffer edges, which is outside fp16 range, so coremltools kept that op in fp32. fp32 ops can't run on the ANE. Clamping it to 100 (only cropped-away samples are affected) put it back on the ANE |
 | *Fixed earlier:* the whole time branch | CPU -> ANE | Tensors 344064 / 86016 / 21504 wide broke the 16384 limit. Fixed by row folding with halo convs |
 
@@ -179,7 +184,7 @@ The GPU is never used in the default `CPU_AND_NE` setting.
 
 The `.mlpackage` files run on iOS unchanged. This has not been tested on a device yet: this machine has no Xcode and no iPhone attached.
 
-- **Format:** ML Program spec v8, opset `CoreML7`, meaning **iOS 17+ / iPadOS 17+** (same as macOS 14). Every op is a basic MIL op (`conv`, `matmul`, `layer_norm`, `softmax`, `exp`, `real_div`, ...). There are no custom layers and no Mac-only features. Inputs and outputs are fp32 multi-arrays.
+- **Format:** ML Program spec v8, opset `CoreML7`, meaning **iOS 17+ / iPadOS 17+** (same as macOS 14). Every op is a basic MIL op (`conv`, `matmul`, `layer_norm`, `softmax`, `exp`, `real_div`, ...). There are no custom layers and no Mac-only features. Inputs and outputs are declared fp16 multi-arrays, so an iOS app should create its `MLMultiArray`s as `.float16` (not tested on a device).
 - **ANE hardware:** the M1 Neural Engine is believed to be the same as the **A14** one (hollance/neural-engine `supported-devices.md`). So **iPhone 12 and newer** should place ops the same way, 100% on the ANE. A15 and later have the same or faster 16-core ANEs. A12/A13 (iPhone XS/11) have an older 8-core ANE; Core ML might push some ops to the GPU or CPU there.
 - **Memory:** on the Mac, process footprint with the ANE is about 340 MB after loading and running (`footprint`), against 700 MB peak RSS on `CPU_ONLY`. The largest tensors are the 110 MB fp16 attention maps (`[8, 2688, 2688]`). That should fit on 4 GB+ iPhones, but check it on a device.
 - **Size:** 87 MB per stem (fp16 weights).

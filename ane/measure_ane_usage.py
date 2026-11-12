@@ -12,6 +12,8 @@ outputs are ready.
   .venv/bin/python ane/measure_ane_usage.py
   .venv/bin/python ane/measure_ane_usage.py --units CPU_AND_NE CPU_ONLY --seconds 15
   .venv/bin/python ane/measure_ane_usage.py --onnx ane/models/htdemucs_drums_ane_fp16.onnx
+  .venv/bin/python ane/measure_ane_usage.py --fused --units CPU_AND_NE CPU_ONLY    # fused Core ML model
+  .venv/bin/python ane/measure_ane_usage.py --fused --onnx ane/models/htdemucs_drums_fused_ane_fp16.onnx --units CPU_AND_NE
 """
 import argparse
 import json
@@ -23,11 +25,12 @@ import time
 
 import numpy as np
 
+import dsp_ane as dsp
 from ane_tools import (
-    COMPUTE_UNITS, MODELS_DIR, mlpackage_path, SAMPLE_RATE, SEGMENT_LEN, SPEC_SHAPE, TIME_SHAPE,
-    cpu_postproc_numpy, cpu_preproc_numpy, fold_time, unfold_time,
+    COMPUTE_UNITS, FUSED_IO, MODELS_DIR, SAMPLE_RATE, SEGMENT_LEN, SPEC_SHAPE, SPLIT_IO, TIME_SHAPE,
+    cpu_postproc_numpy, cpu_preproc_numpy, fold_time, fused_mlpackage_path, mlpackage_path, unfold_time,
 )
-from parity_ane import CoreMLRunner, OnnxCoreMLRunner
+from parity_ane import CoreMLRunner, OnnxCoreMLRunner, fused_chunk
 
 FIELDS = ("ane_power", "gpu_power", "cpu_power", "gpu_active_ratio", "pcpu_active_ratio", "ecpu_active_ratio")
 
@@ -62,16 +65,18 @@ class PowerSampler:
         self.proc.terminate()
 
 
-def run_loop(run, seconds):
+def run_loop(run, seconds, fused=False):
     rng = np.random.default_rng(0)
-    x_spec = rng.standard_normal(SPEC_SHAPE).astype(np.float32)
+    x_spec = rng.standard_normal((1, 2, dsp.N_BLOCKS, dsp.HOP) if fused else SPEC_SHAPE).astype(np.float32)
     x_time = rng.standard_normal(TIME_SHAPE).astype(np.float32)
-    times, t_end = [], time.perf_counter() + seconds
+    times, t_end, cpu0 = [], time.perf_counter() + seconds, time.process_time()
     while time.perf_counter() < t_end:
         t0 = time.perf_counter()
         run(x_spec, x_time)
         times.append(time.perf_counter() - t0)
-    return times
+    # CPU seconds this process spent per run (all threads, user + system). Unlike the SoC power
+    # rails, it is not polluted by other apps.
+    return times, (time.process_time() - cpu0) / max(len(times), 1)
 
 
 def fmt_power(p, base):
@@ -82,10 +87,27 @@ def fmt_power(p, base):
             f" GPU busy {100 * p['gpu_active_ratio']:3.0f}%")
 
 
-def timing_breakdown(run, n=5):
+def timing_breakdown(run, n=5, fused=False):
     """Split one chunk into CPU preprocessing, model, CPU postprocessing."""
     rng = np.random.default_rng(1)
     chunk = (rng.standard_normal((1, 2, SEGMENT_LEN)) * 0.1).astype(np.float32)
+    if fused:
+        pre, mod, post = [], [], []
+        for _ in range(n):
+            t0 = time.perf_counter()
+            x_time, mean_t, std_t = dsp.time_stats_numpy(chunk)
+            blocks, xt = dsp.reflect_pad_numpy(chunk), fold_time(x_time)
+            t1 = time.perf_counter()
+            wb, ot = run(blocks, xt)
+            t2 = time.perf_counter()
+            dsp.crop_istft(wb) + unfold_time(ot)[:, :, 0, :] * std_t + mean_t
+            t3 = time.perf_counter()
+            pre.append(t1 - t0), mod.append(t2 - t1), post.append(t3 - t2)
+        med = lambda v: 1000 * float(np.median(v))  # noqa: E731
+        total = med(pre) + med(mod) + med(post)
+        print(f"  per chunk (median of {n}): CPU pad+stats {med(pre):.1f} ms | fused model {med(mod):.0f} ms | "
+              f"CPU crop+combine {med(post):.1f} ms | total {total:.0f} ms ({SEGMENT_LEN / SAMPLE_RATE / (total / 1000):.1f}x RT)")
+        return
     pre, mod, post = [], [], []
     for _ in range(n):
         t0 = time.perf_counter()
@@ -107,12 +129,13 @@ def timing_breakdown(run, n=5):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", default="drums")
+    p.add_argument("--fused", action="store_true", help="Measure the fused STFT + separation + iSTFT model")
     p.add_argument("--model", default=None, help="Default: ane/models/htdemucs_<source>_ane.mlpackage")
     p.add_argument("--onnx", default=None)
     p.add_argument("--units", nargs="+", choices=COMPUTE_UNITS, default=["CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"])
     p.add_argument("--seconds", type=float, default=10.0)
     args = p.parse_args()
-    args.model = args.model or str(mlpackage_path(args.source))
+    args.model = args.model or str(fused_mlpackage_path(args.source) if args.fused else mlpackage_path(args.source))
     if not shutil.which("macmon"):
         sys.exit("macmon not found: brew install macmon")
 
@@ -123,6 +146,12 @@ def main():
     time.sleep(args.seconds)
     base = sampler.stop()
     print(f"  {fmt_power(base, base)}")
+    if base["ane_power"] > 0.05:
+        print("  WARNING: something else is using the Neural Engine right now (ANE power > 0 at baseline). The ANE is "
+              "shared, so it will roughly halve this model's speed. Wait for it to finish and rerun.")
+    if base["cpu_power"] > 1.5 or base["gpu_active_ratio"] > 0.3:
+        print("  WARNING: the machine is not idle (CPU > 1.5 W or GPU > 30% busy at baseline). Background work "
+              "will slow the model and skew the power deltas; close it and rerun for clean numbers.")
 
     for units in args.units:
         print(f"\n=== {units} ===")
@@ -130,17 +159,19 @@ def main():
         if args.onnx:
             run = OnnxCoreMLRunner(args.onnx, units, cache_dir=MODELS_DIR / "ort_coreml_cache")
         else:
-            run = CoreMLRunner(args.model, units)
+            run = CoreMLRunner(args.model, units, FUSED_IO if args.fused else SPLIT_IO)
         print(f"  load {time.perf_counter() - t0:.1f}s")
-        run_loop(run, 2.0)  # warmup
+        run_loop(run, 2.0, args.fused)  # warmup
         sampler.start()
-        times = run_loop(run, args.seconds)
+        times, cpu_s = run_loop(run, args.seconds, args.fused)
         power = sampler.stop()
         ms = 1000 * np.array(times)
         print(f"  model latency over {len(ms)} runs: median {np.median(ms):.0f} ms | min {ms.min():.0f} | "
               f"p90 {np.percentile(ms, 90):.0f} -> {SEGMENT_LEN / SAMPLE_RATE / (np.median(ms) / 1000):.1f}x RT")
         print(f"  {fmt_power(power, base)}")
-        timing_breakdown(run)
+        print(f"  this process used {1000 * cpu_s:.0f} ms of CPU time per run "
+              f"({100 * cpu_s / np.median(times):.0f}% of one core, {100 * cpu_s / np.median(times) / 8:.0f}% of all 8)")
+        timing_breakdown(run, fused=args.fused)
         del run
     sampler.close()
 

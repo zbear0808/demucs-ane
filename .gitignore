@@ -11,3 +11,5 @@
 
 *.mlpackage/
 ane/parity_real_audio_*.npz
+*.mlmodelc/
+ane/profile_*.json
