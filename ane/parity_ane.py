@@ -1,15 +1,16 @@
 """
-Real-audio parity + latency check for the ANE drums model.
+Real-audio parity + latency check for the ANE single-source models (drums, vocals, ...).
 
 Uses the same reference data as the XDNA2 flow (option_a_bfp16/parity_real_audio.npz,
 built by `option_a_bfp16/parity_real_audio.py make-ref`) and the same metrics:
   spec / time - SNR of the raw model outputs vs the PyTorch FP32 pure-AIE core
-  wav         - separated drums chunk vs stock Demucs forward()
+  wav         - separated stem chunk vs stock Demucs forward()
   mix         - error level below the input mix (the PASS/FAIL criterion)
 
   .venv/bin/python ane/parity_ane.py                                  # Core ML on the ANE
   .venv/bin/python ane/parity_ane.py --units CPU_ONLY                 # same model, CPU
-  .venv/bin/python ane/parity_ane.py --onnx ane/models/htdemucs_drums_ane.onnx   # ONNX via ORT CoreML EP
+  .venv/bin/python ane/parity_ane.py --source vocals                  # vocals model + vocals reference
+  .venv/bin/python ane/parity_ane.py --onnx ane/models/htdemucs_drums_ane_fp16.onnx   # ONNX via ORT CoreML EP
 """
 import argparse
 import sys
@@ -18,7 +19,7 @@ import time
 import numpy as np
 
 from ane_tools import (
-    COMPUTE_UNITS, DEFAULT_MLPACKAGE, DEFAULT_REF, compute_unit, cpu_postproc_numpy, fold_time, load_ref,
+    COMPUTE_UNITS, compute_unit, mlpackage_path, ref_path, cpu_postproc_numpy, fold_time, load_ref,
     snr_db, unfold_time,
 )
 
@@ -102,13 +103,16 @@ def benchmark(run, n: int):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default=str(DEFAULT_MLPACKAGE), help="Core ML .mlpackage")
+    p.add_argument("--source", default="drums", help="Picks the default --model and --ref")
+    p.add_argument("--model", default=None, help="Core ML .mlpackage (default: htdemucs_<source>_ane.mlpackage)")
     p.add_argument("--onnx", default=None, help="Evaluate an ONNX model through ORT's CoreML EP instead")
     p.add_argument("--units", choices=COMPUTE_UNITS, default="CPU_AND_NE")
-    p.add_argument("--ref", default=str(DEFAULT_REF))
+    p.add_argument("--ref", default=None)
     p.add_argument("--min-mix-snr", type=float, default=40.0)
     p.add_argument("--bench", type=int, default=10, help="Latency runs after the parity check (0 = skip)")
     args = p.parse_args()
+    args.model = args.model or str(mlpackage_path(args.source))
+    args.ref = args.ref or str(ref_path(args.source))
 
     t0 = time.perf_counter()
     if args.onnx:
@@ -122,7 +126,7 @@ def main():
     rc = 0
     ref = load_ref(args.ref)
     if ref is None:
-        print(f"[skip] no reference data at {args.ref} (build it with option_a_bfp16/parity_real_audio.py make-ref)")
+        print(f"[skip] no reference data at {args.ref} (export_htdemucs_ane.py builds it)")
     else:
         rc = evaluate(run, ref, args.min_mix_snr)
     if args.bench:

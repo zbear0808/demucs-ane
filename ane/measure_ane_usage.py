@@ -24,7 +24,7 @@ import time
 import numpy as np
 
 from ane_tools import (
-    COMPUTE_UNITS, DEFAULT_MLPACKAGE, MODELS_DIR, SAMPLE_RATE, SEGMENT_LEN, SPEC_SHAPE, TIME_SHAPE,
+    COMPUTE_UNITS, MODELS_DIR, mlpackage_path, SAMPLE_RATE, SEGMENT_LEN, SPEC_SHAPE, TIME_SHAPE,
     cpu_postproc_numpy, cpu_preproc_numpy, fold_time, unfold_time,
 )
 from parity_ane import CoreMLRunner, OnnxCoreMLRunner
@@ -106,11 +106,13 @@ def timing_breakdown(run, n=5):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default=str(DEFAULT_MLPACKAGE))
+    p.add_argument("--source", default="drums")
+    p.add_argument("--model", default=None, help="Default: ane/models/htdemucs_<source>_ane.mlpackage")
     p.add_argument("--onnx", default=None)
     p.add_argument("--units", nargs="+", choices=COMPUTE_UNITS, default=["CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"])
     p.add_argument("--seconds", type=float, default=10.0)
     args = p.parse_args()
+    args.model = args.model or str(mlpackage_path(args.source))
     if not shutil.which("macmon"):
         sys.exit("macmon not found: brew install macmon")
 

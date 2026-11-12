@@ -1,5 +1,5 @@
 """
-ANE-friendly HTDemucs drums core.
+ANE-friendly HTDemucs single-source core (drums, vocals, bass or other).
 
 Starts from the XDNA2 "pure AIE" rewrite (option_a_bfp16/export_candidate_a_pure_aie.py),
 which already removes most of what the Apple Neural Engine dislikes:
@@ -375,12 +375,12 @@ def _replace_modules(module: nn.Module):
             m.activation = ane_gelu
 
 
-class HTDemucsDrumsANE(nn.Module):
+class HTDemucsSourceANE(nn.Module):
     """
     Inputs:  x_spec   [1, 4, 2048, 336]  normalised CaC spectrogram
              x_time   [1, 2, 32, 10752]  normalised waveform, row-folded (= reshape of [1, 2, 344064])
-    Outputs: out_spec [1, 4, 2048, 336]  drums CaC spectrogram
-             out_time [1, 2, 32, 10752]  drums waveform, row-folded
+    Outputs: out_spec [1, 4, 2048, 336]  CaC spectrogram of the selected source (drums, vocals, ...)
+             out_time [1, 2, 32, 10752]  waveform of the selected source, row-folded
     """
 
     def __init__(self, base_model: nn.Module):
@@ -463,6 +463,29 @@ def load_base_model() -> nn.Module:
     return base.eval()
 
 
-def build_ane_model(base: nn.Module = None) -> tuple[HTDemucsDrumsANE, nn.Module]:
-    base = load_base_model() if base is None else base
-    return HTDemucsDrumsANE(copy.deepcopy(base)).eval(), base
+SOURCES = ("drums", "bass", "other", "vocals")
+
+
+def select_source(base: nn.Module, source: str) -> nn.Module:
+    """
+    Copy of `base` whose final decoder layers only produce `source`. The output channels
+    are source-major (freq: 4 CaC channels per source, time: 2 per source), so this is a
+    plain slice. The pure-AIE core then keeps the first source, which is now `source`.
+    """
+    s = list(base.sources).index(source)
+    base = copy.deepcopy(base)
+    c = base.audio_channels
+    for layer, n in ((base.decoder[-1], 2 * c), (base.tdecoder[-1], c)):
+        tr = layer.conv_tr
+        tr.weight = nn.Parameter(tr.weight[:, s * n:(s + 1) * n].clone())
+        if tr.bias is not None:
+            tr.bias = nn.Parameter(tr.bias[s * n:(s + 1) * n].clone())
+        tr.out_channels = n
+        layer.chout = n
+    return base
+
+
+def build_ane_model(base: nn.Module = None, source: str = "drums") -> tuple[HTDemucsSourceANE, nn.Module]:
+    """Returns (ANE model for `source`, single-source base model it was built from)."""
+    base = select_source(load_base_model() if base is None else base, source)
+    return HTDemucsSourceANE(copy.deepcopy(base)).eval(), base

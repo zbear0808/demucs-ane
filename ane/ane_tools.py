@@ -8,9 +8,25 @@ import numpy as np
 ANE_DIR = Path(__file__).resolve().parent
 ROOT = ANE_DIR.parent
 MODELS_DIR = ANE_DIR / "models"
-DEFAULT_MLPACKAGE = MODELS_DIR / "htdemucs_drums_ane.mlpackage"
-DEFAULT_ONNX = MODELS_DIR / "htdemucs_drums_ane.onnx"
-DEFAULT_REF = ROOT / "option_a_bfp16" / "parity_real_audio.npz"
+DRUMS_REF = ROOT / "option_a_bfp16" / "parity_real_audio.npz"
+
+
+def mlpackage_path(source: str = "drums") -> Path:
+    return MODELS_DIR / f"htdemucs_{source}_ane.mlpackage"
+
+
+def onnx_path(source: str = "drums") -> Path:
+    return MODELS_DIR / f"htdemucs_{source}_ane.onnx"
+
+
+def ref_path(source: str = "drums") -> Path:
+    """Drums reuses the XDNA2 reference; other sources get one built by make_ref()."""
+    return DRUMS_REF if source == "drums" else ANE_DIR / f"parity_real_audio_{source}.npz"
+
+
+DEFAULT_MLPACKAGE = mlpackage_path("drums")
+DEFAULT_ONNX = onnx_path("drums")
+DEFAULT_REF = DRUMS_REF
 
 sys.path.insert(0, str(ROOT / "option_a_bfp16"))
 from htdemucs_dsp import SAMPLE_RATE, SEGMENT_LEN, cpu_postproc_numpy, cpu_preproc_numpy  # noqa: E402,F401
@@ -84,7 +100,67 @@ def compute_plan_summary(mlpackage: str, units: str = "CPU_AND_NE", top: int = 1
     return {"count": dict(count), "cost": dict(cost), "off_ane": off_ane}
 
 
+def convert_fp16(module, example: tuple, in_names: list, out_names: list, path) -> "ct.models.MLModel":
+    """torch.export -> fp16 ML Program, saved to `path` (the same settings as the main model)."""
+    import shutil
+
+    import coremltools as ct
+    import torch
+
+    with torch.no_grad():
+        ep = torch.export.export(module.eval(), example).run_decompositions({})
+    ml = ct.convert(
+        ep,
+        inputs=[ct.TensorType(n, shape=tuple(e.shape)) for n, e in zip(in_names, example)],
+        outputs=[ct.TensorType(n) for n in out_names],
+        convert_to="mlprogram", compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.macOS14, compute_units=ct.ComputeUnit.CPU_AND_NE,
+    )
+    path = Path(path)
+    if path.exists():
+        shutil.rmtree(path)
+    ml.save(str(path))
+    return ml
+
+
 def load_ref(path=DEFAULT_REF):
     if not Path(path).exists():
         return None
     return np.load(path)
+
+
+def make_ref(source: str, chunks_from=DRUMS_REF, out=None) -> Path:
+    """
+    Build a real-audio reference for `source` in the same format as parity_real_audio.npz,
+    reusing the music chunks stored in the drums reference (so no audio files are needed).
+    """
+    import torch
+
+    from ane_modules import build_ane_model, load_base_model
+    from option_a_bfp16.export_candidate_a_pure_aie import HTDemucsCandidateAPureAIECore
+
+    out = Path(out or ref_path(source))
+    src = np.load(chunks_from)
+    stock = load_base_model()
+    stock.use_train_segment = False  # 344064 > training segment; let forward() accept it
+    s_idx = list(stock.sources).index(source)
+    _, single = build_ane_model(stock, source)
+    core = HTDemucsCandidateAPureAIECore(single).eval()
+
+    keys = ["chunk", "x_spec", "x_time", "ref_spec", "ref_time", "stock_wav", "mean_s", "std_s", "mean_t", "std_t"]
+    data = {k: [] for k in keys}
+    for i, song in enumerate(src["songs"]):
+        chunk = src["chunk"][i][None]
+        x_spec, x_time, stats = cpu_preproc_numpy(chunk)
+        x_time = x_time.astype(np.float32)
+        with torch.no_grad():
+            ref_spec, ref_time = core(torch.from_numpy(x_spec), torch.from_numpy(x_time))
+            stock_wav = stock(torch.from_numpy(chunk))[0, s_idx].numpy()
+        wav = cpu_postproc_numpy(ref_spec.numpy(), ref_time.numpy(), stats)[0]
+        print(f"  {song}: PyTorch {source} core + NumPy DSP vs stock Demucs {snr_db(stock_wav, wav):.1f} dB")
+        for k, v in zip(keys, [chunk[0], x_spec[0], x_time[0], ref_spec.numpy()[0], ref_time.numpy()[0],
+                               stock_wav, *stats]):
+            data[k].append(np.asarray(v, dtype=np.float32))
+    np.savez(out, songs=src["songs"], **{k: np.stack(v) for k, v in data.items()})
+    print(f"[OK] Saved {out}")
+    return out

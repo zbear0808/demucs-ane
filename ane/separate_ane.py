@@ -1,13 +1,13 @@
 """
-Batch drums separation on the Apple Neural Engine.
+Batch stem separation (drums, vocals, ...) on the Apple Neural Engine.
 
 Same chunking / overlap-add / DSP as option_a_bfp16/batch_separate_drums_npu.py, with the
 NPU session swapped for the Core ML model (or the fp16 ONNX via ORT's CoreML EP).
 A small pipeline overlaps CPU STFT/iSTFT with the ANE run of the neighbouring chunk.
 
-  .venv/bin/python ane/separate_drums_ane.py --input-dir ~/Music/songs
-  .venv/bin/python ane/separate_drums_ane.py --single-file song.wav
-  .venv/bin/python ane/separate_drums_ane.py --single-file song.wav --onnx ane/models/htdemucs_drums_ane_fp16.onnx
+  .venv/bin/python ane/separate_ane.py --input-dir ~/Music/songs
+  .venv/bin/python ane/separate_ane.py --single-file song.wav --source vocals
+  .venv/bin/python ane/separate_ane.py --single-file song.wav --onnx ane/models/htdemucs_drums_ane_fp16.onnx
 """
 import argparse
 import os
@@ -20,9 +20,11 @@ from pathlib import Path
 import numpy as np
 
 from ane_tools import (
-    ANE_DIR, COMPUTE_UNITS, DEFAULT_MLPACKAGE, SAMPLE_RATE, SEGMENT_LEN, cpu_postproc_numpy, cpu_preproc_numpy,
+    ANE_DIR, COMPUTE_UNITS, mlpackage_path, SAMPLE_RATE, SEGMENT_LEN, cpu_postproc_numpy, cpu_preproc_numpy,
     fold_time, unfold_time,
 )
+import dsp_ane as dsp
+from ane_tools import MODELS_DIR
 from parity_ane import CoreMLRunner, OnnxCoreMLRunner
 
 EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".aiff", ".ogg")
@@ -41,8 +43,40 @@ def save_wav(path: str, audio: np.ndarray):
     subprocess.run(cmd, input=audio.T.astype(np.float32).tobytes(), check=True)
 
 
-def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool = True) -> np.ndarray:
-    """audio: [2, n] -> separated drums [2, n] (triangular-window overlap-add)."""
+class CpuDSP:
+    """numpy STFT/iSTFT (htdemucs_dsp.py)."""
+
+    def prep(self, chunk):
+        x_spec, x_time, stats = cpu_preproc_numpy(chunk)
+        return np.ascontiguousarray(x_spec, dtype=np.float32), fold_time(x_time), stats
+
+    def post(self, spec, time_, stats):
+        return cpu_postproc_numpy(spec, unfold_time(time_), stats)[0]
+
+
+class AneDSP:
+    """STFT/iSTFT as Core ML models on the ANE (dsp_ane.py); only padding and the crop stay on the CPU."""
+
+    def __init__(self, units):
+        import coremltools as ct
+
+        cu = getattr(ct.ComputeUnit, units)
+        self.stft = ct.models.MLModel(str(MODELS_DIR / "htdemucs_stft_ane.mlpackage"), compute_units=cu)
+        self.istft = ct.models.MLModel(str(MODELS_DIR / "htdemucs_istft_ane.mlpackage"), compute_units=cu)
+
+    def prep(self, chunk):
+        s = self.stft.predict({"blocks": dsp.reflect_pad_numpy(chunk)})
+        x_time, mean_t, std_t = dsp.time_stats_numpy(chunk)
+        return s["x_spec"], fold_time(x_time), (s["mean_s"], s["std_s"], mean_t, std_t)
+
+    def post(self, spec, time_, stats):
+        mean_s, std_s, mean_t, std_t = stats
+        w = self.istft.predict({"out_spec": spec, "mean_s": mean_s, "std_s": std_s})["wav_blocks"]
+        return (dsp.crop_istft(w) + unfold_time(time_)[:, :, 0, :] * std_t + mean_t)[0]
+
+
+def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool = True, dsp_impl=None) -> np.ndarray:
+    """audio: [2, n] -> separated stem [2, n] (triangular-window overlap-add)."""
     total = audio.shape[-1]
     stride = int((1.0 - overlap) * SEGMENT_LEN)
     ref_mean, ref_std = audio.mean(), audio.std() + 1e-8
@@ -58,11 +92,13 @@ def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool 
     out = np.zeros_like(padded)
     sum_w = np.zeros(padded.shape[-1], dtype=np.float32)
 
+    dsp_impl = dsp_impl or CpuDSP()
+
     def prep(idx):
-        return cpu_preproc_numpy(padded[np.newaxis, :, idx * stride : idx * stride + SEGMENT_LEN])
+        return dsp_impl.prep(padded[np.newaxis, :, idx * stride : idx * stride + SEGMENT_LEN])
 
     def post(idx, spec, time_, stats):
-        wav = cpu_postproc_numpy(spec, unfold_time(time_), stats)[0]
+        wav = dsp_impl.post(spec, time_, stats)
         off = idx * stride
         out[:, off : off + SEGMENT_LEN] += wav * weight
         sum_w[off : off + SEGMENT_LEN] += weight
@@ -76,7 +112,7 @@ def separate_track(run, audio: np.ndarray, overlap: float = 0.25, verbose: bool 
             x_spec, x_time, stats = nxt.result()
             if i + 1 < n_chunks:
                 nxt = pool.submit(prep, i + 1)
-            spec, time_ = run(np.ascontiguousarray(x_spec, dtype=np.float32), fold_time(x_time))
+            spec, time_ = run(x_spec, x_time)
             if pending is not None:
                 pending.result()
             pending = pool.submit(post, i, spec, time_, stats)
@@ -96,13 +132,17 @@ def main():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--input-dir")
     src.add_argument("--single-file")
-    p.add_argument("--output-dir", default=None, help="Default: <input>/ane_drums")
-    p.add_argument("--model", default=str(DEFAULT_MLPACKAGE))
+    p.add_argument("--source", default="drums", help="Stem name: picks the default --model and output naming")
+    p.add_argument("--output-dir", default=None, help="Default: <input>/ane_<source>")
+    p.add_argument("--model", default=None, help="Default: ane/models/htdemucs_<source>_ane.mlpackage")
     p.add_argument("--onnx", default=None, help="Use an ONNX model via ORT's CoreML EP instead of the .mlpackage")
     p.add_argument("--units", choices=COMPUTE_UNITS, default="CPU_AND_NE")
     p.add_argument("--overlap", type=float, default=0.25)
+    p.add_argument("--dsp", choices=("cpu", "ane"), default="cpu",
+                   help="Where the STFT/iSTFT run (ane needs the models from benchmark_pipeline.py)")
     p.add_argument("-q", "--quiet", action="store_true")
     args = p.parse_args()
+    args.model = args.model or str(mlpackage_path(args.source))
 
     if args.single_file:
         tracks = [os.path.abspath(os.path.expanduser(args.single_file))]
@@ -111,7 +151,7 @@ def main():
         base_dir = os.path.abspath(os.path.expanduser(args.input_dir))
         tracks = [os.path.join(base_dir, f) for f in sorted(os.listdir(base_dir))
                   if f.lower().endswith(EXTENSIONS) and not f.startswith(".")]
-    out_dir = args.output_dir or os.path.join(base_dir, "ane_drums")
+    out_dir = args.output_dir or os.path.join(base_dir, f"ane_{args.source}")
     os.makedirs(out_dir, exist_ok=True)
 
     t0 = time.perf_counter()
@@ -119,18 +159,19 @@ def main():
         run = OnnxCoreMLRunner(args.onnx, args.units, cache_dir=ANE_DIR / "models" / "ort_coreml_cache")
     else:
         run = CoreMLRunner(args.model, args.units)
-    print(f"[INIT] {args.onnx or args.model} [{args.units}] loaded in {time.perf_counter() - t0:.1f}s")
+    dsp_impl = AneDSP(args.units) if args.dsp == "ane" else CpuDSP()
+    print(f"[INIT] {args.onnx or args.model} [{args.units}, {args.dsp} STFT] loaded in {time.perf_counter() - t0:.1f}s")
 
     for n, path in enumerate(tracks, 1):
         name = Path(path).stem
         print(f"\n[{n}/{len(tracks)}] {name}")
         audio = load_audio(path)
         t0 = time.perf_counter()
-        drums = separate_track(run, audio, args.overlap, verbose=not args.quiet)
+        stem = separate_track(run, audio, args.overlap, verbose=not args.quiet, dsp_impl=dsp_impl)
         dt = time.perf_counter() - t0
         dur = audio.shape[-1] / SAMPLE_RATE
-        dest = os.path.join(out_dir, f"{name}_drums.wav")
-        save_wav(dest, drums)
+        dest = os.path.join(out_dir, f"{name}_{args.source}.wav")
+        save_wav(dest, stem)
         print(f"  {dur:.1f}s of audio in {dt:.1f}s ({dur / dt:.1f}x real-time) -> {dest}")
     return 0
 

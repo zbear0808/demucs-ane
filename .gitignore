@@ -10,3 +10,4 @@
 **/*cache*/
 
 *.mlpackage/
+ane/parity_real_audio_*.npz
